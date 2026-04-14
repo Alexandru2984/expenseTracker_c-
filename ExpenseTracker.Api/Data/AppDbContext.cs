@@ -9,6 +9,19 @@ public class AppDbContext : DbContext
 
     public DbSet<SubscriptionItem> Subscriptions => Set<SubscriptionItem>();
 
+    public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        var now = DateTime.UtcNow;
+        foreach (var entry in ChangeTracker.Entries<SubscriptionItem>())
+        {
+            if (entry.State == EntityState.Added)
+                entry.Entity.CreatedAt = now;
+            if (entry.State is EntityState.Added or EntityState.Modified)
+                entry.Entity.UpdatedAt = now;
+        }
+        return base.SaveChangesAsync(cancellationToken);
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -33,6 +46,10 @@ public class AppDbContext : DbContext
 
             entity.Property(e => e.BillingPeriod)
                   .HasConversion<string>();
+
+            entity.Property(e => e.NextBillingDate)
+                  .HasColumnType("date");
         });
     }
 }
+

@@ -1,12 +1,16 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using ExpenseTracker.Api.Data;
+using ExpenseTracker.Api.Dtos;
 using ExpenseTracker.Api.Models;
 
 namespace ExpenseTracker.Api.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Authorize]
 public class SubscriptionsController : ControllerBase
 {
     private readonly AppDbContext _db;
@@ -16,12 +20,21 @@ public class SubscriptionsController : ControllerBase
         _db = db;
     }
 
-    // GET /api/subscriptions
+    // GET /api/subscriptions?skip=0&take=50
     [HttpGet]
-    public async Task<IActionResult> GetAll()
+    public async Task<IActionResult> GetAll([FromQuery] int skip = 0, [FromQuery] int take = 50)
     {
-        var items = await _db.Subscriptions.OrderBy(s => s.Name).ToListAsync();
-        return Ok(items);
+        take = Math.Min(take, 200);
+
+        var query = _db.Subscriptions.OrderBy(s => s.Name);
+        var total = await query.CountAsync();
+        var items = await query.Skip(skip).Take(take).ToListAsync();
+
+        return Ok(new PagedResult<SubscriptionResponseDto>
+        {
+            Items = items.Select(ToDto),
+            Total = total
+        });
     }
 
     // GET /api/subscriptions/{id}
@@ -30,40 +43,54 @@ public class SubscriptionsController : ControllerBase
     {
         var item = await _db.Subscriptions.FindAsync(id);
         if (item is null) return NotFound();
-        return Ok(item);
+        return Ok(ToDto(item));
     }
 
     // POST /api/subscriptions
     [HttpPost]
-    public async Task<IActionResult> Create([FromBody] SubscriptionItem input)
+    [EnableRateLimiting("writes")]
+    public async Task<IActionResult> Create([FromBody] CreateSubscriptionDto dto)
     {
-        input.Id = Guid.NewGuid();
-        _db.Subscriptions.Add(input);
+        var item = new SubscriptionItem
+        {
+            Id = Guid.NewGuid(),
+            Name = dto.Name,
+            Cost = dto.Cost,
+            Currency = dto.Currency,
+            BillingPeriod = dto.BillingPeriod,
+            NextBillingDate = dto.NextBillingDate,
+            Category = dto.Category,
+            IsActive = true
+        };
+
+        _db.Subscriptions.Add(item);
         await _db.SaveChangesAsync();
-        return CreatedAtAction(nameof(GetById), new { id = input.Id }, input);
+        return CreatedAtAction(nameof(GetById), new { id = item.Id }, ToDto(item));
     }
 
     // PUT /api/subscriptions/{id}
     [HttpPut("{id:guid}")]
-    public async Task<IActionResult> Update(Guid id, [FromBody] SubscriptionItem input)
+    [EnableRateLimiting("writes")]
+    public async Task<IActionResult> Update(Guid id, [FromBody] UpdateSubscriptionDto dto)
     {
         var existing = await _db.Subscriptions.FindAsync(id);
         if (existing is null) return NotFound();
 
-        existing.Name = input.Name;
-        existing.Cost = input.Cost;
-        existing.Currency = input.Currency;
-        existing.BillingPeriod = input.BillingPeriod;
-        existing.NextBillingDate = input.NextBillingDate;
-        existing.Category = input.Category;
-        existing.IsActive = input.IsActive;
+        existing.Name = dto.Name;
+        existing.Cost = dto.Cost;
+        existing.Currency = dto.Currency;
+        existing.BillingPeriod = dto.BillingPeriod;
+        existing.NextBillingDate = dto.NextBillingDate;
+        existing.Category = dto.Category;
+        existing.IsActive = dto.IsActive;
 
         await _db.SaveChangesAsync();
-        return Ok(existing);
+        return Ok(ToDto(existing));
     }
 
     // DELETE /api/subscriptions/{id}
     [HttpDelete("{id:guid}")]
+    [EnableRateLimiting("writes")]
     public async Task<IActionResult> Delete(Guid id)
     {
         var item = await _db.Subscriptions.FindAsync(id);
@@ -78,28 +105,45 @@ public class SubscriptionsController : ControllerBase
     [HttpGet("summary")]
     public async Task<IActionResult> GetSummary()
     {
-        var active = await _db.Subscriptions
-            .Where(s => s.IsActive)
-            .ToListAsync();
-
-        var totalMonthly = active.Sum(s =>
-            s.BillingPeriod == BillingPeriod.Yearly ? s.Cost / 12 : s.Cost);
+        var all = await _db.Subscriptions.ToListAsync();
+        var active = all.Where(s => s.IsActive).ToList();
 
         var byCurrency = active
             .GroupBy(s => s.Currency)
-            .Select(g => new
+            .Select(g =>
             {
-                Currency = g.Key,
-                MonthlyTotal = g.Sum(s =>
-                    s.BillingPeriod == BillingPeriod.Yearly ? s.Cost / 12 : s.Cost)
-            });
+                var monthly = g.Sum(s =>
+                    s.BillingPeriod == BillingPeriod.Yearly ? s.Cost / 12m : s.Cost);
+                return new CurrencySummary
+                {
+                    Currency = g.Key,
+                    MonthlyTotal = Math.Round(monthly, 2),
+                    YearlyTotal = Math.Round(monthly * 12, 2),
+                    ActiveCount = g.Count()
+                };
+            })
+            .OrderBy(x => x.Currency);
 
-        return Ok(new
+        return Ok(new SummaryResponseDto
         {
-            TotalMonthlyEquivalent = Math.Round(totalMonthly, 2),
             ByCurrency = byCurrency,
             ActiveSubscriptions = active.Count,
-            TotalSubscriptions = await _db.Subscriptions.CountAsync()
+            TotalSubscriptions = all.Count
         });
     }
+
+    private static SubscriptionResponseDto ToDto(SubscriptionItem item) => new()
+    {
+        Id = item.Id,
+        Name = item.Name,
+        Cost = item.Cost,
+        Currency = item.Currency,
+        BillingPeriod = item.BillingPeriod,
+        NextBillingDate = item.NextBillingDate,
+        Category = item.Category,
+        IsActive = item.IsActive,
+        CreatedAt = item.CreatedAt,
+        UpdatedAt = item.UpdatedAt
+    };
 }
+

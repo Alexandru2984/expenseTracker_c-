@@ -18,9 +18,14 @@ public class SubscriptionItem
 
     public BillingPeriod BillingPeriod { get; set; } = BillingPeriod.Monthly;
 
-    public DateTime NextBillingDate { get; set; }
+    public DateOnly NextBillingDate { get; set; }
 
     public string Category { get; set; } = string.Empty;
 
     public bool IsActive { get; set; } = true;
+
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
+

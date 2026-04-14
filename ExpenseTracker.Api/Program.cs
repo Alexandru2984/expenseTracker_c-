@@ -1,59 +1,182 @@
+using System.Net;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Serilog;
+using ExpenseTracker.Api.Auth;
 using ExpenseTracker.Api.Data;
 
-var builder = WebApplication.CreateBuilder(args);
+// ── Bootstrap logger (captures startup errors before host is built) ───────────
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
 
-// ── Services ─────────────────────────────────────────────────────────────────
+try
+{
+    var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers()
-    .AddJsonOptions(options =>
+    // ── Serilog ───────────────────────────────────────────────────────────────
+    builder.Host.UseSerilog((ctx, services, cfg) =>
+        cfg.ReadFrom.Configuration(ctx.Configuration)
+           .ReadFrom.Services(services)
+           .Enrich.FromLogContext()
+           .WriteTo.Console(outputTemplate:
+               "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}"));
+
+    // ── Validate required secrets at startup ──────────────────────────────────
+    if (builder.Environment.IsProduction())
     {
-        // Serializes enums as strings (Monthly/Yearly) instead of integers
-        options.JsonSerializerOptions.Converters.Add(
-            new System.Text.Json.Serialization.JsonStringEnumConverter());
+        var apiToken = builder.Configuration["API_TOKEN"];
+        if (string.IsNullOrWhiteSpace(apiToken))
+        {
+            Log.Fatal("API_TOKEN environment variable is not set. Refusing to start in Production.");
+            return 1;
+        }
+        var connStr = builder.Configuration.GetConnectionString("DefaultConnection");
+        if (string.IsNullOrWhiteSpace(connStr))
+        {
+            Log.Fatal("ConnectionStrings__DefaultConnection is not set. Refusing to start in Production.");
+            return 1;
+        }
+    }
+
+    // ── Services ──────────────────────────────────────────────────────────────
+    builder.Services.AddControllers()
+        .AddJsonOptions(options =>
+        {
+            options.JsonSerializerOptions.Converters.Add(
+                new System.Text.Json.Serialization.JsonStringEnumConverter());
+        });
+
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen();
+
+    // ── Database ──────────────────────────────────────────────────────────────
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")!;
+    builder.Services.AddDbContext<AppDbContext>(options =>
+        options.UseNpgsql(connectionString));
+
+    // ── Authentication (static bearer token) ─────────────────────────────────
+    builder.Services.AddAuthentication("ApiKey")
+        .AddScheme<ApiKeyAuthenticationOptions, ApiKeyAuthenticationHandler>("ApiKey", _ => { });
+
+    builder.Services.AddAuthorization();
+
+    // ── CORS (origins from config) ─────────────────────────────────────────────
+    var allowedOrigins = (builder.Configuration["Cors:AllowedOrigins"] ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    builder.Services.AddCors(options =>
+    {
+        options.AddPolicy("Frontend", policy =>
+        {
+            if (allowedOrigins.Length > 0)
+                policy.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod();
+        });
     });
 
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-// ── Database (PostgreSQL via EF Core) ─────────────────────────────────────────
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
-
-// ── CORS (allows Vue dev server on port 5173 to call the API) ─────────────────
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("VueFrontend", policy =>
+    // ── Rate limiting ─────────────────────────────────────────────────────────
+    builder.Services.AddRateLimiter(options =>
     {
-        policy.WithOrigins(
-                "http://localhost:5173",
-                "http://localhost:5174",
-                "http://localhost:5175")
-              .AllowAnyHeader()
-              .AllowAnyMethod();
+        options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+        // Global policy: 100 req/min per IP
+        options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, IPAddress>(ctx =>
+        {
+            var ip = ctx.Connection.RemoteIpAddress ?? IPAddress.Loopback;
+            return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 100,
+                Window = TimeSpan.FromMinutes(1),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            });
+        });
+
+        // Stricter policy for writes: 20 req/min per IP
+        options.AddPolicy("writes", ctx =>
+        {
+            var ip = ctx.Connection.RemoteIpAddress ?? IPAddress.Loopback;
+            return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 20,
+                Window = TimeSpan.FromMinutes(1),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            });
+        });
     });
-});
 
-var app = builder.Build();
+    // ── Health checks ─────────────────────────────────────────────────────────
+    builder.Services.AddHealthChecks()
+        .AddNpgSql(connectionString, name: "postgres");
 
-// ── Auto-migrate on startup (convenience for dev; remove for production CI/CD) ─
-using (var scope = app.Services.CreateScope())
-{
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    db.Database.Migrate();
+    // ── Problem details (RFC 7807) ────────────────────────────────────────────
+    builder.Services.AddProblemDetails();
+
+    var app = builder.Build();
+
+    // ── Auto-migrate in Development only ──────────────────────────────────────
+    if (app.Environment.IsDevelopment())
+    {
+        using var scope = app.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.Database.Migrate();
+    }
+
+    // ── Middleware Pipeline ───────────────────────────────────────────────────
+    app.UseExceptionHandler(errApp =>
+    {
+        errApp.Run(async ctx =>
+        {
+            var feature = ctx.Features.Get<IExceptionHandlerFeature>();
+            var isDev = app.Environment.IsDevelopment();
+
+            ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            ctx.Response.ContentType = "application/problem+json";
+
+            var pd = new ProblemDetails
+            {
+                Status = 500,
+                Title = "An unexpected error occurred.",
+                Detail = isDev ? feature?.Error.ToString() : null
+            };
+
+            await ctx.Response.WriteAsJsonAsync(pd);
+        });
+    });
+
+    app.UseSerilogRequestLogging();
+
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseSwagger();
+        app.UseSwaggerUI();
+    }
+
+    app.UseCors("Frontend");
+
+    app.UseRateLimiter();
+
+    app.UseAuthentication();
+    app.UseAuthorization();
+
+    app.MapHealthChecks("/health").AllowAnonymous();
+    app.MapControllers();
+
+    await app.RunAsync();
+    return 0;
 }
-
-// ── Middleware Pipeline ────────────────────────────────────────────────────────
-if (app.Environment.IsDevelopment())
+catch (Exception ex) when (ex is not OperationCanceledException)
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    Log.Fatal(ex, "Host terminated unexpectedly");
+    return 1;
 }
-
-app.UseCors("VueFrontend");
-
-app.UseAuthorization();
-app.MapControllers();
-
-app.Run();
+finally
+{
+    await Log.CloseAndFlushAsync();
+}
 
