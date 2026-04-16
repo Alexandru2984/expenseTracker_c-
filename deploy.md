@@ -1,12 +1,13 @@
 # Deploy Guide — Expense Tracker
 
-Ghid pentru deployment pe un VPS Linux cu Docker.
+Ghid pentru deployment pe un VPS Linux cu Docker și Nginx (host).
 
 ## Cerințe preliminare
 
 - VPS Linux cu Docker Engine ≥ 24 și Docker Compose CLI (plugin `compose`)
-- Un domeniu cu DNS-ul `A` setat pe IP-ul VPS-ului
-- Porturile 80 și 443 deschise în firewall
+- Un domeniu cu DNS-ul `A` setat pe IP-ul VPS-ului (ex: `expenses.micutu.com`)
+- Nginx instalat pe sistemul gazdă (host)
+- Porturile 80 și 443 deschise în firewall-ul host-ului
 
 ---
 
@@ -16,7 +17,9 @@ Ghid pentru deployment pe un VPS Linux cu Docker.
 # Instalează Docker (Ubuntu/Debian)
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
-# Logout și login pentru a aplica grupul
+
+# Instalează Nginx (Ubuntu/Debian)
+sudo apt update && sudo apt install nginx certbot python3-certbot-nginx -y
 ```
 
 ---
@@ -24,8 +27,8 @@ sudo usermod -aG docker $USER
 ## 2. Clonează repo-ul
 
 ```bash
-git clone https://github.com/<user>/expense-tracker.git
-cd expense-tracker
+git clone https://github.com/Alexandru2984/expenseTracker_cs.git
+cd expenseTracker_cs
 ```
 
 ---
@@ -34,7 +37,7 @@ cd expense-tracker
 
 ```bash
 cp .env.example .env
-nano .env   # sau vim .env
+nano .env
 ```
 
 Completează toate valorile din `.env`:
@@ -42,115 +45,95 @@ Completează toate valorile din `.env`:
 | Variabilă | Descriere |
 |---|---|
 | `ConnectionStrings__DefaultConnection` | String de conexiune PostgreSQL (host=db) |
-| `API_TOKEN` | Token secret lung (`openssl rand -hex 32`) |
-| `Cors__AllowedOrigins` | Lasă gol — frontend e same-origin prin Caddy |
+| `Jwt__Secret` | Cheie secretă JWT (min 32 caractere, `openssl rand -hex 32`) |
+| `Cors__AllowedOrigins` | Lasă gol (frontend e same-origin prin Nginx) |
 | `ASPNETCORE_ENVIRONMENT` | `Production` |
 | `POSTGRES_DB` | Numele bazei de date |
 | `POSTGRES_USER` | Utilizatorul PostgreSQL |
-| `POSTGRES_PASSWORD` | Parola PostgreSQL (trebuie să coincidă cu cea din connection string) |
+| `POSTGRES_PASSWORD` | Parola PostgreSQL |
 
 ---
 
-## 4. Configurează Caddy
+## 4. Pornire containere
 
-```bash
-cp Caddyfile.example Caddyfile
-nano Caddyfile   # Înlocuiește `your-domain.com` cu domeniul tău
-```
+### 4.1 Prima rulare — migrații baza de date
 
----
-
-## 5. Prima rulare — migrații baza de date
-
-Rulează migrația EF Core **înainte** de prima pornire a API-ului:
+Rulează migrația EF Core:
 
 ```bash
 docker compose run --rm migrate
 ```
 
-> Această comandă pornește un container efemer care aplică toate migrațiile
-> în baza de date, apoi se oprește. Rulează-l și la fiecare update care
-> include migrații noi.
-
-**Generarea manuală a bundle-ului EF (pentru CI/CD):**
+### 4.2 Construire UI și pornire servicii
 
 ```bash
-cd ExpenseTracker.Api
-dotnet tool install --global dotnet-ef
-dotnet ef migrations bundle --self-contained -r linux-musl-x64 -o efbundle
-```
-
----
-
-## 6. Pornire producție
-
-```bash
+docker compose up -d ui-builder  # Construiește activele statice în ./frontend_dist
 docker compose up -d
 ```
 
-Aceasta va:
-1. Construi imaginile (API + UI)
-2. Copia fișierele statice ale frontend-ului în volumul Caddy
-3. Porni db, api, caddy în fundal
+---
 
-Verifică statusul:
+## 5. Configurează Nginx (Host)
+
+Creează o configurație în `/etc/nginx/sites-available/expenses.micutu.com`:
+
+```nginx
+server {
+    listen 80;
+    server_name expenses.micutu.com;
+
+    # Frontend statice
+    location / {
+        root /calea/catre/expenseTracker_cs/frontend_dist;
+        index index.html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # API Proxy
+    location /api/ {
+        proxy_pass http://localhost:8080/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'keep-alive';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Health check
+    location /health {
+        proxy_pass http://localhost:8080/health;
+    }
+}
+```
+
+Activează site-ul și instalează SSL:
 
 ```bash
-docker compose ps
-docker compose logs -f api
+sudo ln -s /etc/nginx/sites-available/expenses.micutu.com /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d expenses.micutu.com
 ```
 
 ---
 
-## 7. Verificare
-
-- `https://your-domain.com` → frontend Vue
-- `https://your-domain.com/health` → `{"status":"Healthy",...}`
-- `curl -H "Authorization: Bearer YOUR_TOKEN" https://your-domain.com/api/subscriptions` → `[...]`
-
----
-
-## 8. Update aplicație
+## 6. Update aplicație
 
 ```bash
 git pull
 docker compose build
 docker compose run --rm migrate   # dacă există migrații noi
-docker compose up -d
+docker compose up -d ui-builder
+docker compose up -d api
 ```
 
 ---
 
-## 9. Backup & Restore
-
-### Backup manual
+## 7. Logs
 
 ```bash
-./scripts/backup-db.sh
-```
-
-Fișierele `.sql.gz` se salvează în `./backups/`.
-
-### Backup automat (cron zilnic la 3:00)
-
-```bash
-crontab -e
-# Adaugă:
-0 3 * * * /path/to/expense-tracker/scripts/backup-db.sh >> /var/log/expense-tracker-backup.log 2>&1
-```
-
-### Restore
-
-```bash
-./scripts/restore-db.sh backups/expense_tracker_2026-04-14_03-00-00.sql.gz
-```
-
----
-
-## 10. Logs
-
-```bash
-docker compose logs api        # API logs
-docker compose logs caddy      # Caddy access logs
-docker compose logs db         # PostgreSQL logs
+docker compose logs -f api     # Log-uri API (Serilog)
+docker compose logs -f db      # Log-uri PostgreSQL
+sudo tail -f /var/log/nginx/access.log # Log-uri Nginx host
 ```
