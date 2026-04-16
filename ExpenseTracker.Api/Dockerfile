@@ -20,7 +20,7 @@ ENV PATH="$PATH:/root/.dotnet/tools"
 
 COPY . ./
 RUN dotnet ef migrations bundle \
-    --self-contained -r linux-musl-x64 \
+    --self-contained -r linux-x64 \
     -o /efbundle
 
 # ── Stage 3: Runtime (Alpine, non-root) ───────────────────────────────────────
